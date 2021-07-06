@@ -1,0 +1,662 @@
+---
+title: "night_night"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+# Проект создания рекомендательной системы по фильмам. 
+
+## Разведочный анализ данных
+
+На начальном этапе мы подгрузили датасет с данными об оценках пользователей и объединили с изначальным датасетом о фильмах
+
+```{r message=FALSE, warning=FALSE}
+library(readr)
+library(ggplot2)
+library(dplyr)
+library(readr)
+library(knitr)
+library(stringr)
+library(tidyverse)
+library(igraph)
+library(tnet)
+marks_33 <- read_csv("movie_full_info 1-3.csv")
+movies <- read_csv("shared/minor2_2017/data/netflix/movie_info.csv") 
+movies=movies %>% rename(movie_id = id)
+all_movies=full_join(marks_33, movies, by = "movie_id")
+```
+
+```{r , include=FALSE}
+dim(movies)
+colnames(movies)
+dim(marks_33)
+colnames(marks_33)
+```
+
+```{r }
+length(unique(marks_33$user_id)) # 466407 пользователь дал оценку к некоторому количеству фильмов (всего фильмов 1867)
+howmm = marks_33 %>% 
+group_by(user_id) %>% 
+summarise(n = n())
+
+ggplot(howmm, aes(x = n)) +
+geom_histogram(binwidth = .5, colour = "black", fill = "white") +
+geom_vline(aes(xintercept = mean(n, na.rm = T)), 
+color = "red", linetype = "dashed", size = 1)
+mean(howmm$n) # в среднем человек оценивает 30 фильмов
+
+```
+
+Одной из наших гипотез была о том, что есть связь между бюджетом фильма и кассовыми сборами, которую мы решили проверить. То есть, чем больше был бюджет фильма, тем больше будут кассовые сборы.
+```{r }
+hist(movies$revenue)
+hist(movies$budget)
+
+shapiro.test(movies$revenue) #ненормальное распределение
+shapiro.test(movies$budget)#ненормальное распределение
+wilcox.test(movies$revenue,movies$budget) #p-value= 0.000000001342 на уровне значимости 0.05 , следовательно мы отвергаетм H0, говорящую о том, что связи между бюджетом фильма и его кассовыми сборами статистически нет.
+
+ggplot(data=movies)+
+geom_histogram(aes(x=budget,y=revenue),stat='identity', binwidth = 1, fill="#008080", col="#483D8B", alpha = 0.5)
+
+cor.test(movies$revenue, movies$budget,method = "spearman", exact = FALSE, conf.level = 0.95) # так ка коэффициет Спирмена не равен нулю, и 0.6632233> 0, то связь между бюджетом и его доходом находится в следующем соотношении : чем больше боджет фильма, тем больше его доход.
+```
+
+```{r }
+library(readr)
+library(stringr)
+library(tidyverse)
+library(dplyr)
+library(ggplot2)
+```
+
+Еще одной гипотезой на этапе разведочного анализа была гипотеза о том, что : Сиквел , как правило, приносит больший доход, но получают более низкий рейтинг, чем оригинальный фильм. Для проверки этой гипотезы мы смотрели на сиквелы, которые уже есть в нашем датасете с фильмами.
+```{r}
+m=movies %>% filter(str_detect(title, "Star Trek")) %>% arrange(-year)
+ggplot(data = m)+
+geom_histogram(aes(x=revenue, y=vote_average),stat = "identity", binwidth = 50, fill="#008080", col="#483D8B", alpha = 0.5)
+hist(m$popularity)
+
+cor.test(m$revenue, m$vote_average,method = "spearman", exact = FALSE, conf.level = 0.95)
+```
+
+```{r}
+m1=movies %>% filter(str_detect(title, "Superman")) %>% arrange(-year)
+ggplot(data = m1)+
+geom_histogram(aes(x=revenue, y=vote_average),stat = "identity", binwidth = 50, fill="#008080", col="#483D8B", alpha = 0.5)
+hist(m$popularity)
+
+```
+
+```{r }
+m2=movies %>% filter(str_detect(title, "Halloween")) %>% arrange(-year)
+hist(m2$budget)
+hist(m2$vote_average)
+hist(m2$revenue)
+```
+
+```{r }
+m3=movies %>% filter(str_detect(title, "Back to the Future")) %>% arrange(-year)
+hist(m3$budget)
+hist(m3$vote_average)
+hist(m3$revenue)
+```
+
+Прослеживается тенденция в сиквелах(и в фильмах в общем) больше прибыль => выше рейтинг фильма.Однако, как оказалось, нельзя одназначно скачать, что сиквелы хуже или лучше, так как это зависит от того, наколько удачная франшиза.
+
+## Кластеризация
+
+Работа нашей команды над созданием рекомендательной системы фильмов началась с анализа датасета с фильмами, в ходе которого были выявлены интересные закономерности, в дальнейшем используемые для рекомендаций пользователям.
+Также мы провели анализ литературных источников (статей) на данную тему, где в основном уделялось внимание жанрам в составлении систем, на которых мы в дальнейшем и сосредоточимся. 
+
+### Сетевой анализ жанров, стран и компаний
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+library(knitr)
+library(igraph)
+library(tnet)
+library(tidyr)
+```
+
+### Кластеризируем по жанрам
+Для начала нам нужно перевести данные из формата json и построить матрицу по жанрам.
+```{r message=FALSE, warning=FALSE}
+
+source("~/shared/minor2_2017/2-tm-net/lab08-proj-data/extract_json.R") 
+movies_genres <- read_csv("shared/minor2_2017/data/netflix/movies.csv")
+moviesmovies <- read_csv("shared/minor2_2017/data/netflix/movies.csv") ##начальный movies из датасета, нужен дальше
+movies_genres = extract_json(df = movies_genres, col = "genres") #переформатирование, достаем из json
+rownames(movies_genres) <- str_c("id", movies_genres$movie_id, sep = "_")
+
+movies_gen = movies %>% 
+select(genres,movie_id)
+movies_genres = movies_genres %>% 
+select(-movie_id, -genres, -title, -budget, -homepage, -keywords, -original_language, -original_title, -overview, -popularity, -production_companies, -production_countries, -release_date, -revenue, -runtime, -spoken_languages, -status, -tagline) %>% 
+as.matrix()
+```
+
+ Здесь сеть, которую очень плохо видно, она промежуточная
+```{r include=FALSE}
+
+g <- graph_from_incidence_matrix(movies_genres)
+
+is.bipartite(g)
+
+pr = bipartite.projection(g) 
+
+p <- pr[[1]]
+p
+
+V(p)$label <- NA
+lt = layout.fruchterman.reingold(p)
+plot(p, vertex.size = 2, layout = lt)
+```
+
+Взвешенная проекция  обычной проекции(Ньюман)
+
+ 
+Давайте взвесим и построим распределение силы связи между фильмами с указанием среднего,укрупняем сеть, оставляем те фильмы, которые хорошо кластеризуется
+```{r echo=FALSE}
+movies_id <- rownames(movies_genres)
+
+df <- data.frame(moviesmovies = str_replace(movies_id, "id_", ""), i = 1:545)
+
+p = projecting_tm(movies_genres, method="Newman")
+p <- left_join(p, df, by = "i")
+
+df <- data.frame(movies_1 = str_replace(movies_id, "id_", ""), j = 1:545)
+p <- left_join(p, df, by = "j")
+p = dplyr::select(p, i = moviesmovies, j = movies_1, w)
+
+ggplot(p) + 
+geom_histogram(aes(x=w), fill = "pink") +
+geom_vline(aes(xintercept=mean(w)), color="blue", linetype="dashed", size=1) +
+xlab("Newman's coefficient") 
+
+```
+
+Коэффициент равный 0.03, лучше всего раскрывает структуру кластеризации и число кластеров увеличивается
+
+```{r include=FALSE}
+p1 = filter(p, w >= 0.03) %>% select(-w) # здесь можно менять w
+ 
+set.seed(483)
+ 
+net1 <- simplify(graph_from_edgelist(as.matrix(p1), directed=F))
+V(net1)$color <- "steel blue"
+V(net1)$label <- movies_id
+
+ 
+plot(net1, vertex.label.color = "black", vertex.size = 3, layout = layout.kamada.kawai(net1))
+```
+ 
+Здесь показана сеть с кластерами по методу fastgreedy.community,с подписями узлов по id фильма.
+ 
+```{r, dpi=100, fig.height=7, fig.width=7}
+membership1 = membership(fastgreedy.community(net1))
+
+ 
+plot(net1, layout = layout.kamada.kawai(net1), edge.arrow.size = 0, vertex.color = membership1, vertex.size = 5,vertex.label.cex = 0.7, vertex.label.color = "black", margin = -0.1)
+
+
+```
+
+В целом сеть сейчас хорошо кластеризована и видно что жанры довольно неплохо определяются в кластеры. К примеру, посмотрев по id четко выделяется совместный кластер криминальных драм(темно-синий), переходящий в просто драмы и триллеры (зеленый)
+
+### Production companies clusters
+
+ Остальные сети и кластеры по production companies and countries строились по такому же методу, только использовалась втораю функция extract_jason и формировалась матрицу через spread
+
+```{r}
+movies_pr <- read_csv("shared/minor2_2017/data/netflix/movies.csv")
+meta <- movies_pr %>% 
+  dplyr::select(movie_id, production_companies)
+
+meta_n = extract_json2(df = meta, col = "production_companies")
+
+pg = spread(meta_n, key = production_companies_sep, value = production_companies_v)
+
+# Здесь работает вторая функция json, после нее создаются две колонки в которых прописаны узлы, то есть каждый фильм повторяется, потом приводится все к широкому формату.
+rownames(pg ) <- str_c("id", pg$movie_id, sep = "_")
+ 
+pg = pg %>% 
+  select(-movie_id, -production_companies) %>% 
+  as.matrix()
+```
+
+```{r include=FALSE}
+library(igraph)
+ 
+ 
+g2 <- graph_from_incidence_matrix(pg)
+is.bipartite(g2)
+ 
+pr2 = bipartite.projection(g2) 
+ 
+p2 <- pr2[[1]]
+p2
+ 
+V(p2)$label <- NA
+lt = layout.fruchterman.reingold(p2)
+plot(p2, vertex.size = 2, layout = lt)
+ 
+```
+
+```{r echo=TRUE}
+library(tnet)
+ 
+movies_id <- rownames(pg)
+ 
+df <- data.frame(movies = str_replace(movies_id, "id_", ""), i = 1:522)
+ 
+p2 = projecting_tm(pg, method="Newman")
+p2 <- left_join(p2, df, by = "i")
+ 
+df <- data.frame(movies_1 = str_replace(movies_id, "id_", ""), j = 1:522)
+p2 <- left_join(p2, df, by = "j")
+p2 = dplyr::select(p2, i = movies, j = movies_1, w)
+ 
+ggplot(p2) + 
+  geom_histogram(aes(x=w), fill = "pink") +
+  geom_vline(aes(xintercept=mean(w)), color="blue", linetype="dashed", size=1) +
+  xlab("Newman's coefficient") 
+ 
+```
+ 
+```{r include=FALSE}
+p2 = filter(p2, w >= 0.03) %>% select(-w) # здесь можно менять w
+ 
+set.seed(483)
+ 
+net12 <- simplify(graph_from_edgelist(as.matrix(p2), directed=F))
+V(net12)$color <- "steel blue"
+V(net12)$label <- movies_id
+ 
+plot(net12, vertex.label.color = "black", vertex.size = 3, layout = layout.kamada.kawai(net12))
+```
+ 
+```{r, dpi=100, fig.height=7, fig.width=7}
+membership = membership(fastgreedy.community(net12))
+ 
+plot(net12, layout = layout.kamada.kawai(net12), edge.arrow.size = 0, vertex.color = membership, vertex.size = 5,vertex.label.cex = 0.4, margin = -0.1)
+```
+ 
+
+### Production countries clusters
+
+В целом, анализ компаний и стран дал не такие же хорошие результаты, как и жанры, хотя сети и получились хорошо кластеризованными. Скорее всего это из-за перекоса в сторону США и ее production companies, которые появлялись в каждом кластере, а количество других стан было не такое значительное.
+
+```{r}
+movies_cn <- read_csv("shared/minor2_2017/data/netflix/movies.csv")
+metac <- movies_cn %>% 
+  dplyr::select(movie_id, production_countries)
+
+meta_cn = extract_json2(df = metac, col = "production_countries")
+
+cn = spread(meta_cn, key = production_countries_sep, value = production_countries_v)
+
+
+
+rownames(cn ) <- str_c("id", cn$movie_id, sep = "_")
+ 
+cn = cn %>% 
+  select(-movie_id, -production_countries) %>% 
+  as.matrix()
+```
+
+```{r include=FALSE}
+library(igraph)
+ 
+ 
+g3 <- graph_from_incidence_matrix(cn)
+is.bipartite(g3)
+ 
+pr3 = bipartite.projection(g3) 
+ 
+p3 <- pr3[[1]]
+p3
+ 
+V(p3)$label <- NA
+lt = layout.fruchterman.reingold(p3)
+plot(p3, vertex.size = 2, layout = lt)
+ 
+```
+
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+library(tnet)
+ 
+movies_id <- rownames(cn)
+ 
+df <- data.frame(movies = str_replace(movies_id, "id_", ""), i = 1:535)
+ 
+p3 = projecting_tm(cn, method="Newman")
+p3 <- left_join(p3, df, by = "i")
+ 
+df <- data.frame(movies_1 = str_replace(movies_id, "id_", ""), j = 1:535)
+p3 <- left_join(p3, df, by = "j")
+p3 = dplyr::select(p3, i = movies, j = movies_1, w)
+ 
+ggplot(p3) + 
+  geom_histogram(aes(x=w), fill = "pink") +
+  geom_vline(aes(xintercept=mean(w)), color="blue", linetype="dashed", size=1) +
+  xlab("Newman's coefficient") 
+ 
+```
+ 
+```{r include=FALSE}
+p3 = filter(p3, w >= 0.03) %>% select(-w) 
+ 
+set.seed(483)
+ 
+net13 <- simplify(graph_from_edgelist(as.matrix(p3), directed=F))
+V(net13)$color <- "steel blue"
+V(net13)$label <- movies_id
+ 
+plot(net13, vertex.label.color = "black", vertex.size = 3, layout = layout.kamada.kawai(net13))
+```
+ 
+ 
+```{r, dpi=100, fig.height=7, fig.width=7}
+membership = membership(fastgreedy.community(net13))
+ 
+plot(net13, layout = layout.kamada.kawai(net13), edge.arrow.size = 0, vertex.color = membership, vertex.size = 5,vertex.label.cex = 0.9, vertex.label.color = "black" , margin = -0.1)
+```
+
+После этапа кластеризации мы решили, что основным критерием в составлении рекомендательной системы будут жанры.
+
+## Текстовый анализ данных
+
+```{r}
+#Построим облако слов, встречающихся чаще всего в overview
+movies <- read.csv("~/shared/minor2_2017/data/netflix/movie_info.csv")
+library(dplyr)
+movies1 = dplyr::select(movies, overview, genres)
+```
+ 
+```{r}
+#Уберём кавычки, знаки препинания и прочее прочее, чтобы удобнее считать частоту слов 
+library(stringr)
+ 
+movies1$overview = tolower(movies$overview)
+movies1$overview = str_replace_all(movies1$overview, "w/", "with")
+movies1$overview = str_replace_all(movies1$overview, "\\&quot\\;", " ")
+movies1$overview = str_replace_all(movies1$overview, "\\&apos\\;", " ")
+movies1$overview = str_replace_all(movies1$overview, "id", "")
+movies1$overview = str_replace_all(movies1$overview, "[[:punct:]]", "")
+movies1$overview = str_replace_all(movies1$overview, "[0-9]+", "")
+ 
+movies1$genres = tolower(movies1$genres)
+movies1$genres = str_replace_all(movies1$genres, "w/", "with")
+movies1$genres = str_replace_all(movies1$genres, "\\&quot\\;", " ")
+movies1$genres = str_replace_all(movies1$genres, "\\&apos\\;", " ")
+movies1$genres = str_replace_all(movies1$genres, "id", "")
+movies1$genres = str_replace_all(movies1$genres, "name", "")
+movies1$genres = str_replace_all(movies1$genres, "[[:punct:]]", "")
+movies1$genres = str_replace_all(movies1$genres, "[0-9]+", "")
+ 
+#Переведём жанры в длинный формат и уберём стопслова
+library(dplyr)
+library(tidytext)
+library(stopwords)
+movies1.tidy <- movies1 %>%
+    unnest_tokens(words, overview)
+stopwords <- data.frame(words=stopwords("en"), stringsAsFactors=FALSE)
+movies1.tidy <- movies1.tidy %>%
+    unnest_tokens(genres, genres)
+movies1.nonstop <- movies1.tidy %>%
+    anti_join(stopwords)
+ 
+#Строим облако
+library(wordcloud)
+movies1.nonstop %>%
+    count(words) %>%
+    with(wordcloud(words, n, max.words = 100))
+```
+ 
+```{r}
+#Строим облако ключевых слов по частоте
+#Для этого уберём кавычки, знаки препинания и прочее прочее, чтобы удобнее считать частоту слов 
+movies2 = dplyr::select(movies, keywords, genres)
+movies2$keywords = tolower(movies2$keywords)
+movies2$keywords = str_replace_all(movies2$keywords, "w/", "with")
+movies2$keywords = str_replace_all(movies2$keywords, "\\&quot\\;", " ")
+movies2$keywords = str_replace_all(movies2$keywords, "\\&apos\\;", " ")
+movies2$keywords = str_replace_all(movies2$keywords, "id", "")
+movies2$keywords = str_replace_all(movies2$keywords, "name", "")
+movies2$keywords = str_replace_all(movies2$keywords, "[[:punct:]]", "")
+movies2$keywords = str_replace_all(movies2$keywords, "[0-9]+", "")
+stopwords <- data.frame(keywords=stopwords("en"), stringsAsFactors=FALSE)
+movies2 <- movies2 %>%
+    unnest_tokens(keywords, keywords)
+movies2.nonstop <- movies2%>%
+    anti_join(stopwords)
+```
+ 
+```{r}
+#Облако частоты ключевых слов
+library(wordcloud)
+movies2.nonstop %>%
+    count(keywords) %>%
+    with(wordcloud(keywords, n, max.words = 100, min.freq=3))
+```
+
+```{r}
+#Посчитаем частоту всех ключевых слов, чтобы учесть это в нашей системе
+movies3 <- movies2.nonstop %>% group_by(keywords) %>% count(keywords)
+
+```
+
+```{r}
+#Посмотрим на режиссеров с самым большим количеством наград
+movie_full_info1 <- read.csv("movie_full_info1-3.csv")
+library(dplyr)
+moviemovie= dplyr::select(movie_full_info1, director_name, title, "Academy.Award.Winner", "Bafta.Winner", "Cannes.Winner", "Winner.Berlinale", year)
+moviemovie <- moviemovie[! rowSums(is.na(moviemovie)) == 4  , ] #выберем только те строки, в которых указана хоть одна награда (т.е. в ряду 4 NA)
+moviemovie1 <- moviemovie %>% group_by(director_name) %>% count(director_name) #Посчитаем строки по директорам
+top_n(moviemovie1, 5)
+```
+
+```{r}
+#Года, в которые получено больше всего наград
+moviemovie2 <- moviemovie %>% group_by(year) %>% count(year)
+top_n(moviemovie2, 5)
+```
+
+```{r}
+#Кластеризируем директоров по жанрам
+library(stringr)
+
+movie_full_info1$genres = tolower(movie_full_info1$genres)
+movie_full_info1$genres = str_replace_all(movie_full_info1$genres, "w/", "with")
+movie_full_info1$genres = str_replace_all(movie_full_info1$genres, "\\&quot\\;", " ")
+movie_full_info1$genres = str_replace_all(movie_full_info1$genres, "\\&apos\\;", " ")
+movie_full_info1$genres = str_replace_all(movie_full_info1$genres, "id", "")
+movie_full_info1$genres = str_replace_all(movie_full_info1$genres, "name", "")
+movie_full_info1$genres = str_replace_all(movie_full_info1$genres, "[[:punct:]]", "")
+movie_full_info1$genres = str_replace_all(movie_full_info1$genres, "[0-9]+", "")
+
+library(tidyverse)
+library(tidytext)
+movies_full.tidy <- movie_full_info1 %>%
+  unnest_tokens(genres, genres)
+
+movies_full.tidy= dplyr::select(movies_full.tidy, director_name, genres)
+
+movies.tdm = movies_full.tidy %>% 
+  dplyr::count(director_name, genres) %>% 
+  spread(genres, n, fill = 0)
+df = movies.tdm[-(1:2)] %>% as.matrix()
+library(factoextra)
+res <- hcut(df, hc_method = "ward.D", k = 10, stand = TRUE)
+factoextra::fviz_dend(res)
+fviz_cluster(res)
+
+clusters = cbind(movies.tdm[1:2], cluster = res$cluster)
+
+
+```
+
+```{r include=FALSE}
+clusters = cbind(movies.tdm[1:2], cluster = res$cluster)
+
+table(clusters$director_name, clusters$cluster)
+```
+
+```{r}
+clusters = inner_join(clusters, movies_full.tidy)
+summary(clusters)
+```
+
+#Рекомендательная система (content-based подход)
+
+#Прогружаем библиотеку
+```{r include=FALSE}
+library(dplyr)
+library(ggplot2)
+library(stringr)
+library(tidyr)
+library(recommenderlab)
+library(readr)
+```
+
+```{r}
+ratings33 <- read_csv("shared/minor2_2017/data/netflix/groups/marks_33.csv")
+movies <- read_csv("~/shared/minor2_2017/data/netflix/movie_info.csv") %>% rename(movie_id = id)
+all_movies = movies %>% dplyr::filter(movies$movie_id %in% ratings33$movie_id)
+```
+
+#Рекомендательная система (SVD)
+
+```{r}
+rates33 = select(ratings33, user_id, movie_id, mark)
+rm(ratings33)
+```
+
+```{r}
+rates = spread(rates33, key = movie_id, value = mark)
+rownames(rates) = rates$user_id
+rates = select(rates, -user_id)
+```
+
+```{r message=FALSE, warning=FALSE}
+rates = as.matrix(rates)
+r = as(rates, "realRatingMatrix")
+```
+
+```{r}
+ratings_movies = r[rowCounts(r) > 5, colCounts(r) > 10] 
+```
+
+```{r}
+test_ind <- sample(1:nrow(ratings_movies), size = nrow(ratings_movies)*0.2)
+recc_data_train <- ratings_movies[-test_ind, ]
+recc_data_test <- ratings_movies[test_ind, ]
+
+recc_model <- Recommender(data = recc_data_train, method = "SVD", parameter = list(k = 30))
+```
+
+```{r include=FALSE}
+recc_predicted <- predict(object = recc_model, newdata = recc_data_test, n = 10)
+recc_predicted
+str(recc_predicted)
+```
+
+```{r}
+recc_user_15 <- recc_predicted@items[[15]]
+movies_user_15 <- recc_predicted@itemLabels[recc_user_15]
+names_movies_user_15 <- movies$title[match(movies_user_15, movies$movie_id)]
+names_movies_user_15
+```
+Отсюда следует,что пользователю №15 будет выведено 10 фильмов, которые, исходя из его предпочтений, будут ему интересны.
+
+## Final system with Awards
+
+```{r}
+ratings33 <- read_csv("shared/minor2_2017/data/netflix/groups/marks_33.csv")
+movies <- read_csv("~/shared/minor2_2017/data/netflix/movie_info.csv") %>% rename(movie_id = id)
+awards <- read_csv("~/movie_full_info1-3.csv")
+movies1 = movies %>% dplyr::filter(movies$movie_id %in% ratings33$movie_id)
+movies1 = movies %>% dplyr::filter(movies$movie_id %in% awards$id_1)
+moviemovie1<- mutate(movies, rowSums = rowSums((is.na(movies))))
+moviemovie1<-mutate(moviemovie1, Awards_number = 4 - rowSums)
+moviemovie1= dplyr::select(moviemovie1, title, Awards_number)
+movies1 <- full_join(movies,moviemovie1)
+```
+
+```{r}
+rates33 = select(ratings33, user_id, movie_id, mark)
+rm(ratings33)
+```
+
+```{r}
+movies1 = movies1 %>% dplyr::select(title, movie_id, genres, popularity, tagline, Awards_number)
+```
+
+```{r}
+data = rates33 %>% group_by(movie_id) %>% summarize(mark = mean(mark, na.rm = T))
+```
+
+```{r}
+data = inner_join(data, movies1)
+```
+
+```{r}
+data = data %>% mutate(digitsTitle = str_detect(data$title, "[0-9]"))
+data = data %>% mutate(tlLength = str_length(data$tagline))
+```
+
+```{r}
+meta1 <- movies1 %>% dplyr::select(title, movie_id, genres, popularity, tagline, Awards_number) %>% 
+filter(genres != "[]") %>% unique() 
+source("~/shared/minor2_2017/2-tm-net/lab08-proj-data/extract_json.R") 
+meta_nn = extract_json(df = meta1, col = "genres")
+data = extract_json(df = data, col = "genres")
+```
+
+```{r}
+data = meta_nn %>% dplyr::select(-tagline, -title, -genres)
+```
+
+```{r}
+rownames(data) = data$movie_id
+data = data %>% dplyr::select(-movie_id)
+sim = lsa::cosine(t(as.matrix(data)))
+```
+
+```{r}
+userId = 111343
+
+user = rates33 %>% filter(user_id == userId & mark == 5)
+mostSimilar = head(sort(sim[,as.character(user$movie_id)], decreasing = T), n = 5)
+a = which(sim[,as.character(user$movie_id)] %in% mostSimilar, arr.ind = TRUE)
+rows = a %% dim(sim)[1]
+result = rownames(sim)[rows]
+filter(movies1,movie_id %in% result) %>% dplyr::select(title)
+```
+
+```{r}
+
+getFilms = function(userId){
+user = rates33 %>% filter(user_id == userId & mark == 5)
+
+if (length(user)==0) {
+recommend = "The Lord of The Ring"
+} else {
+mostSimilar = head(sort(sim[,as.character(user$movie_id)], decreasing = T), n = 5)
+a = which(sim[,as.character(user$movie_id)] %in% mostSimilar, arr.ind = TRUE)
+rows = a %% dim(sim)[1]
+result = rownames(sim)[rows]
+recommend = filter(movies1,movie_id %in% result) %>% group_by(Awards_number) %>% dplyr::select(title) 
+}
+
+recommend
+}
+
+getFilms(1402412) #Рекомендации для id = 1402412
+
+getFilms(1601783) #Рекомендации для id = 1601783
+
+getFilms(111343) #Рекомендации для id = 111343
+```
